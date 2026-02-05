@@ -485,16 +485,27 @@ class FunASRNano(nn.Module):
                 encoder_out_lens = kwargs["audio_embedding_lens"]
             else:
                 speech_lengths = batch["speech_lengths"][:, 0]
+                
                 # fp16
                 if kwargs.get("fp16", False):
-                    speech = speech.to(torch.float16)
+                    encoder_dtype = torch.float16
                 elif kwargs.get("bf16", False):
-                    speech = speech.to(torch.bfloat16)
+                    encoder_dtype = torch.bfloat16
+                else :
+                    encoder_dtype = torch.float32
                 # audio encoder
-                encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
-
-                # audio_adaptor
-                adaptor_out, adaptor_out_lens = self.audio_adaptor(encoder_out, encoder_out_lens)
+                device_type = torch.device(kwargs.get("device", "cuda")).type
+                with torch.autocast(
+                    device_type=device_type if device_type in ["cuda", "xpu", "mps"] else "cpu",
+                    enabled=True if encoder_dtype != torch.float32 else False,
+                    dtype=encoder_dtype,
+                ):
+                    self.audio_encoder = self.audio_encoder.to(encoder_dtype)
+                    self.audio_adaptor = self.audio_adaptor.to(encoder_dtype)
+                    speech = speech.to(encoder_dtype)
+                    encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+                    # audio_adaptor
+                    adaptor_out, adaptor_out_lens = self.audio_adaptor(encoder_out, encoder_out_lens)
                 meta_data["encoder_out"] = encoder_out
                 meta_data["encoder_out_lens"] = encoder_out_lens
                 meta_data["audio_adaptor_out"] = adaptor_out
@@ -645,9 +656,9 @@ class FunASRNano(nn.Module):
                 ctc_results.append({"key": key[i], "text": text, "ctc_logits": x})
 
         llm_dtype = kwargs.get("llm_dtype", "fp32")
-        if llm_dtype == "fp32":
-            llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
-            llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
+        # if llm_dtype == "fp32":
+        #     llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
+        #     llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
 
         device_type = torch.device(kwargs.get("device", "cuda")).type
         with torch.autocast(
@@ -694,6 +705,243 @@ class FunASRNano(nn.Module):
                     skip_special_tokens=kwargs.get("skip_special_tokens", True),
                 )[0]
                 loss = model_outputs.loss.item()
+        response = kwargs.get("prev_text", "") + response
+
+        ibest_writer = None
+        if kwargs.get("output_dir") is not None:
+            if not hasattr(self, "writer"):
+                self.writer = DatadirWriter(kwargs.get("output_dir"))
+            ibest_writer = self.writer[f"{0 + 1}best_recog"]
+
+        results = []
+        response_clean = re.sub(r"[^\w\s\u3000\u4e00-\u9fff]+", "", response)
+        result_i = {
+            "key": key[0],
+            "text": re.sub(r"\s+", " ", response.replace("/sil", " ")),
+            "text_tn": response_clean,
+            "label": label,
+        }
+        if loss is not None:
+            result_i["loss"] = loss
+        results.append(result_i)
+
+        for ctc_result, result in zip(ctc_results, results):
+            result["ctc_text"] = ctc_result["text"].replace("<|nospeech|>", "")
+            target_ids = torch.tensor(
+                self.ctc_tokenizer.encode(result["ctc_text"]), dtype=torch.int64
+            )
+            result["ctc_timestamps"] = forced_align(
+                ctc_result["ctc_logits"], target_ids, self.blank_id
+            )
+            target_ids = torch.tensor(self.ctc_tokenizer.encode(result["text"]), dtype=torch.int64)
+            result["timestamps"] = forced_align(ctc_result["ctc_logits"], target_ids, self.blank_id)
+            for timestamps in [result["timestamps"], result["ctc_timestamps"]]:
+                for timestamp in timestamps:
+                    timestamp["token"] = self.ctc_tokenizer.decode([timestamp["token"]])
+                    timestamp["start_time"] = timestamp["start_time"] * 6 * 10 / 1000
+                    timestamp["end_time"] = timestamp["end_time"] * 6 * 10 / 1000
+
+        if ibest_writer is not None:
+            ibest_writer["text"][key[0]] = response.replace("\n", " ")
+            ibest_writer["label"][key[0]] = label.replace("\n", " ")
+            ibest_writer["text_tn"][key[0]] = response_clean
+
+        return results, meta_data
+
+    def preprocess(
+        self,
+        data_in,
+        data_lengths=None,
+        key: list = None,
+        tokenizer=None,
+        frontend=None,
+        **kwargs,
+    ):
+        prompt = self.get_prompt(
+            kwargs.get("hotwords", []), kwargs.get("language", None), kwargs.get("itn", True)
+        )
+        data_in = [self.generate_chatml(prompt, data) for data in data_in]
+
+        if key is None:
+            key = []
+            for _ in data_in:
+                chars = string.ascii_letters + string.digits
+                key.append("rand_key_" + "".join(random.choice(chars) for _ in range(13)))
+
+        meta_data = {}
+
+        if kwargs.get("batch_size", 1) > 1:
+            raise NotImplementedError("batch decoding is not implemented")
+
+        contents = self.data_template(data_in[0])
+        output = self.data_load_speech(contents, tokenizer, frontend, meta_data=meta_data, **kwargs)
+        batch = to_device(output, kwargs["device"])
+        
+        return batch, meta_data, contents, key
+
+    def predict(self, batch, key, meta_data, **kwargs):
+        # audio encoder
+        speech = batch["speech"]
+
+        if len(speech) > 0:
+            if "audio_embedding" in kwargs and "audio_embedding_lens" in kwargs:
+                encoder_out = kwargs["audio_embedding"]
+                encoder_out_lens = kwargs["audio_embedding_lens"]
+            else:
+                speech_lengths = batch["speech_lengths"][:, 0]
+                # fp16
+                if kwargs.get("fp16", False):
+                    encoder_dtype = torch.float16
+                elif kwargs.get("bf16", False):
+                    encoder_dtype = torch.bfloat16
+                else :
+                    encoder_dtype = torch.float32
+
+                # audio encoder
+                device_type = torch.device(kwargs.get("device", "cuda")).type
+                with torch.autocast(
+                    device_type=device_type if device_type in ["cuda", "xpu", "mps"] else "cpu",
+                    enabled=True if encoder_dtype != torch.float32 else False,
+                    dtype=encoder_dtype,
+                ):
+                    self.audio_encoder = self.audio_encoder.to(encoder_dtype)
+                    self.audio_adaptor = self.audio_adaptor.to(encoder_dtype)
+                    speech = speech.to(encoder_dtype)
+                    encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+                    # audio_adaptor
+                    adaptor_out, adaptor_out_lens = self.audio_adaptor(encoder_out, encoder_out_lens)
+                meta_data["encoder_out"] = encoder_out
+                meta_data["encoder_out_lens"] = encoder_out_lens
+                meta_data["audio_adaptor_out"] = adaptor_out
+                meta_data["audio_adaptor_out_lens"] = adaptor_out_lens
+
+        input_ids = batch["input_ids"]
+        source_ids = batch["source_ids"]
+        fbank_beg = batch["fbank_beg"]
+        fake_token_len = batch["fake_token_len"]
+
+        if not kwargs.get("teacherforcing", False):
+            input_ids = source_ids
+
+        input_ids[input_ids < 0] = 0
+        inputs_embeds = self.llm.model.get_input_embeddings()(input_ids)
+
+        batch_size, token_num, dims = inputs_embeds.shape
+
+        fake_token_len[fake_token_len < 0] = 0
+        fbank_beg[fbank_beg < 0] = 0
+
+        speech_idx = 0
+        for batch_idx in range(batch_size):
+            for turn_id in range(fbank_beg.shape[1]):
+                fbank_beg_idx = fbank_beg[batch_idx, turn_id].item()
+                if fbank_beg_idx > 0:
+                    speech_token_len = fake_token_len[batch_idx, turn_id]
+                    speech_token = adaptor_out[speech_idx, :speech_token_len, :]
+
+                    try:
+                        inputs_embeds[
+                            batch_idx,
+                            fbank_beg_idx : fbank_beg_idx + speech_token_len,
+                            :,
+                        ] = speech_token
+                    except Exception as e:
+                        #
+                        logging.error(f"{str(e)}, {traceback.format_exc()}")
+                        logging.info(
+                            f"batch_idx: {batch_idx}, inputs_embeds: {inputs_embeds.shape}, fbank_beg_idx: {fbank_beg_idx}, speech_token_len: {speech_token_len}, adaptor_out: {adaptor_out.shape}, adaptor_out_lens: {adaptor_out_lens}, fake_token_len: {fake_token_len}, speech_lengths: {speech_lengths}"
+                        )
+                        speech_token_len = adaptor_out_lens[speech_idx].item()
+                        speech_token = adaptor_out[speech_idx, :speech_token_len, :]
+                        inputs_embeds[
+                            batch_idx,
+                            fbank_beg_idx : fbank_beg_idx + speech_token_len,
+                            :,
+                        ] = speech_token
+
+                    speech_idx += 1
+
+        ctc_results = []
+        if self.ctc_decoder is not None:
+            encoder_out = meta_data["encoder_out"]
+            encoder_out_lens = meta_data["encoder_out_lens"]
+            decoder_out, decoder_out_lens = self.ctc_decoder(encoder_out, encoder_out_lens)
+            ctc_logits = self.ctc.log_softmax(decoder_out)
+
+            b, n, d = encoder_out.size()
+            if isinstance(key[0], (list, tuple)):
+                key = key[0]
+            if len(key) < b:
+                key = key * b
+            for i in range(b):
+                x = ctc_logits[i, : encoder_out_lens[i].item(), :]
+                yseq = x.argmax(dim=-1)
+                yseq = torch.unique_consecutive(yseq, dim=-1)
+                mask = yseq != self.blank_id
+                token_int = yseq[mask].tolist()
+                # Change integer-ids to tokens
+                text = self.ctc_tokenizer.decode(token_int)
+                ctc_results.append({"key": key[i], "text": text, "ctc_logits": x})
+
+        llm_dtype = kwargs.get("llm_dtype", "fp32")
+        # if llm_dtype == "fp32":
+        #     llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
+        #     llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
+
+        device_type = torch.device(kwargs.get("device", "cuda")).type
+        with torch.autocast(
+            device_type=device_type if device_type in ["cuda", "xpu", "mps"] else "cpu",
+            enabled=True if llm_dtype != "fp32" else False,
+            dtype=dtype_map[llm_dtype],
+        ):
+            self.llm = self.llm.to(dtype_map[llm_dtype])
+            inputs_embeds = inputs_embeds.to(dtype_map[llm_dtype])
+            llm_kwargs = kwargs.get("llm_kwargs", {})
+            if not kwargs.get("teacherforcing", False):
+                attention_mask = batch.get("attention_mask", None)
+                generated_ids = self.llm.generate(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    max_new_tokens=kwargs.get("max_length", 512),
+                    pad_token_id=self.llm.config.pad_token_id or self.llm.config.eos_token_id,
+                    **llm_kwargs,
+                )
+
+                # response = tokenizer.batch_decode(
+                #     generated_ids,
+                #     skip_special_tokens=kwargs.get("skip_special_tokens", True),
+                # )[0]
+
+                loss = None
+            else:
+                labels_ids = batch["labels_ids"]
+                labels_ids[labels_ids == -1] = -100
+                attention_mask = batch.get("attention_mask", None)
+                model_outputs = self.llm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    labels=labels_ids,
+                    pad_token_id=self.llm.config.pad_token_id or self.llm.config.eos_token_id,
+                    **llm_kwargs,
+                )
+
+                generated_ids = torch.argmax(model_outputs.logits, -1)[:, source_ids.shape[1] :]
+                # response = tokenizer.batch_decode(
+                #     preds,
+                #     add_special_tokens=False,
+                #     skip_special_tokens=kwargs.get("skip_special_tokens", True),
+                # )[0]
+                loss = model_outputs.loss.item()
+                
+        return generated_ids, ctc_results, loss
+    
+    def postprocess(self, generated_ids, ctc_results, loss, key, contents, meta_data, tokenizer, **kwargs):
+        response = tokenizer.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=kwargs.get("skip_special_tokens", True),
+                )[0]
+
+        label = contents["assistant"][-1]
         response = kwargs.get("prev_text", "") + response
 
         ibest_writer = None

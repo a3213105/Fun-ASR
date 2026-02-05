@@ -1401,8 +1401,8 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
 
         return generated_ids, ctc_results
 
-    def postprocess(self, generated_ids, ctc_results, contents, key, tokenizer, **kwargs,):
-        if tokenizer is None :
+    def postprocess(self, generated_ids, ctc_results, contents, key, meta_data, tokenizer, **kwargs,):
+        if self.tokenizer is not None :
             tokenizer = self.tokenizer
 
         label = contents["assistant"][-1]
@@ -1439,7 +1439,7 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
                     timestamp["start_time"] = timestamp["start_time"] * 6 * 10 / 1000
                     timestamp["end_time"] = timestamp["end_time"] * 6 * 10 / 1000
                     
-        return results
+        return results, meta_data
 
     def inference(self, data_in, data_lengths=None, key: list = None, tokenizer=None, frontend=None, **kwargs,):
         if tokenizer is None :
@@ -1448,8 +1448,7 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
             frontend = self.frontend
         outputs, contents, key, meta_data = self.preprocess(data_in, data_lengths, key, tokenizer, frontend, **kwargs)
         generated_ids, ctc_results = self.predict(outputs, key, **kwargs)
-        results = self.postprocess(generated_ids, ctc_results, contents, key, tokenizer, **kwargs)
-        return results, meta_data
+        return self.postprocess(generated_ids, ctc_results, contents, key, meta_data, tokenizer, **kwargs)
  
     def forward(self, inputs_embeds, attention_mask, past_key_values=None, **kwargs):
         self.dec_request.start_async({"inputs_embeds":inputs_embeds,
@@ -1472,7 +1471,6 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
             self.text_request.wait()
             model_inputs["inputs_embeds"] = torch.from_numpy(self.text_request.get_output_tensor(0).data)
         return model_inputs
-
 
 class UnimernetEncoderModel(OV_Operator):
     def setup_model(self, stream_num = 2, bf16=True, f16=True, 
