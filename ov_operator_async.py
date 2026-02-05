@@ -940,13 +940,16 @@ FUNASR_Decoder_MODEL_NAME = "funasr_llm_decoder.xml"
 FUNASR_OV_CONFIG_NAME = "ov_config.yaml"
 FUNASR_Frontend_CONFIG_NAME = "frontend_config.json"
 
+
 def forced_align(log_probs: torch.Tensor, targets: torch.Tensor, blank: int = 0):
     items = []
     try:
+        import torchaudio.functional as TAF
+        from itertools import groupby
         # The current version only supports batch_size==1.
         log_probs, targets = log_probs.unsqueeze(0).cpu(), targets.unsqueeze(0).cpu()
         assert log_probs.shape[1] >= targets.shape[1]
-        alignments, scores = F.forced_align(log_probs, targets, blank=blank)
+        alignments, scores = TAF.forced_align(log_probs, targets, blank=blank)
         alignments, scores = alignments[0], torch.exp(scores[0]).tolist()
         # use enumerate to keep track of the original indices, then group by token value
         for token, group in groupby(enumerate(alignments), key=lambda item: item[1]):
@@ -964,9 +967,10 @@ def forced_align(log_probs: torch.Tensor, targets: torch.Tensor, blank: int = 0)
                     "score": round(score, 3),
                 }
             )
-    except:
-        pass
+    except Exception as e:
+        print(f"### forced_align failed: {e}")
     return items
+
 
 class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
     def __init__(self, ov_core, model_path, enc_type, dec_type, cache_size, disable_ctc=False):
@@ -1359,7 +1363,7 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
                             :,
                         ] = speech_token
                     except Exception as e:
-                        print(f"#### e={e}")
+                        print(f"#### patch inputs_embeds, erro={e}")
                         speech_token_len = adaptor_out_lens[speech_idx].item()
                         speech_token = adaptor_out[speech_idx, :speech_token_len, :]
                         inputs_embeds[
@@ -1423,7 +1427,6 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
             "label": label,
         }
         results.append(result_i)
-
         for ctc_result, result in zip(ctc_results, results):
             result["ctc_text"] = ctc_result["text"].replace("<|nospeech|>", "")
             target_ids = torch.tensor(
