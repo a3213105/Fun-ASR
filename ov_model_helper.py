@@ -1683,7 +1683,7 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
 
     def convert_ov_encoder_model(self, speech, speech_lengths, input_ids, **kwargs):
         if not self.ov_audio_path.exists() :
-            example_inputs = {"speech":speech, "speech_lengths":speech_lengths}
+            example_inputs = {"speech":speech, "speech_lengths":torch.tensor([1]).to(dtype=torch.int32)}
             ov_model = convert_model(self.audio_enc_wrapper, example_input=example_inputs)
             save_model(ov_model, self.ov_audio_path, compress_to_fp16=False)
             print(f"✅ ModelEncoder completed {self.ov_audio_path}")
@@ -1691,7 +1691,7 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
             cleanup_torchscript_cache()
 
         if not self.ov_audio_ctc_path.exists() :
-            example_inputs = {"speech":speech, "speech_lengths":speech_lengths}
+            example_inputs = {"speech":speech, "speech_lengths":torch.tensor([1]).to(dtype=torch.int32)}
             ov_model = convert_model(self.audio_enc_ctc_wrapper, example_input=example_inputs)
             save_model(ov_model, self.ov_audio_ctc_path, compress_to_fp16=False)
             print(f"✅ ModelEncoder completed {self.ov_audio_ctc_path}")

@@ -1058,21 +1058,22 @@ class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
             ov_config = {}
             ov_config['NUM_STREAMS'] = 1
             ov_config['PERF_COUNT'] = 'NO'
-            ov_config['INFERENCE_PRECISION_HINT'] = self.enc_type
             ov_config['PERFORMANCE_HINT'] = 'LATENCY'
            
-            model = self.ov_core.read_model(self.ov_audio_path)
-            compiled_model = self.ov_core.compile_model(model, device, ov_config)
-            self.audio_request = compiled_model.create_infer_request()
-
-            model = self.ov_core.read_model(self.ov_text_path)
-            compiled_model = self.ov_core.compile_model(model, device, ov_config)
-            self.text_request = compiled_model.create_infer_request()
-
             ov_config['INFERENCE_PRECISION_HINT'] = self.dec_type
             model = self.ov_core.read_model(self.ov_decoder_path)
             compiled_model = self.ov_core.compile_model(model, device, ov_config)
             self.dec_request = compiled_model.create_infer_request()
+
+            ov_config['INFERENCE_PRECISION_HINT'] = self.enc_type
+            model = self.ov_core.read_model(self.ov_text_path)
+            compiled_model = self.ov_core.compile_model(model, device, ov_config)
+            self.text_request = compiled_model.create_infer_request()
+
+            ov_config['SNIPPETS_MODE'] = 'DISABLE'
+            model = self.ov_core.read_model(self.ov_audio_path)
+            compiled_model = self.ov_core.compile_model(model, device, ov_config)
+            self.audio_request = compiled_model.create_infer_request()
 
             self.using_ov = True
         except Exception as e:
