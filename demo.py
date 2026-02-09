@@ -45,7 +45,8 @@ def parse_args() -> argparse.Namespace:
 def pt_run_short(pt_model, kwargs, wav_path):
     tokenizer = kwargs.get("tokenizer", None)
     res = pt_model.inference(data_in=[wav_path], **kwargs)
-    text = res[0][0]['text']
+    # text = res[0][0]['text']
+    text = res[0][0]    
     print(f"Results: {text}")
 
 def pt_run_long(pt_model, kwargs, wav_path):
@@ -64,9 +65,9 @@ def pt_run_long(pt_model, kwargs, wav_path):
     print(f"Results: {prev_text}")
 
 def pt_run(model_dir, wav_path, chunk_size) :
-    print(f"### RUN PyTorch Inference ###")
+    print(f"### RUN PyTorch Inference ###， model_dir={model_dir}， wav_path={wav_path}, chunk_size={chunk_size}")
     from model import FunASRNano
-    model_dir = "../Fun-ASR-Nano-2512"
+    # model_dir = "../Fun-ASR-Nano-2512"
     device = (
         "cuda:0"
         if torch.cuda.is_available()
@@ -89,7 +90,8 @@ def pt_run(model_dir, wav_path, chunk_size) :
 
 def ov_run_short(ov_model, kwargs, wav_path):
     res = ov_model.inference(data_in=[wav_path], **kwargs)
-    text = res[0][0]['text']
+    # text = res[0][0]['text']
+    text = res[0][0]
     print(f"Results: {text}")
 
 def ov_run_long(ov_model, kwargs, wav_path):
@@ -107,16 +109,16 @@ def ov_run_long(ov_model, kwargs, wav_path):
     #     print(prev_text)
     print(f"Results: {prev_text}")
 
-def ov_run(model_dir, wav_path, chunk_size) :
-    print(f"### RUN OpenVINO Inference ###")
+def ov_run(model_dir, wav_path, chunk_size, disable_ctc=True) :
+    print(f"### RUN OpenVINO Inference ### disable_ctc={disable_ctc}, chunk_size={chunk_size}")
     from ov_operator_async import FunAsrNanoEncDecModel
     # model_dir = "../Fun-ASR-Nano-2512-ov"
     ov_model = FunAsrNanoEncDecModel(ov_core=None,
                                         model_path=model_dir,
-                                        enc_type="bf16",
-                                        dec_type="bf16",
+                                        enc_type="f32",
+                                        dec_type="f32",
                                         cache_size=1024,
-                                        disable_ctc=True)
+                                        disable_ctc=disable_ctc)
     kwargs = {}
     kwargs['tokenizer']=ov_model.tokenizer
     #kwargs['hotwords']=["开放时间"]
@@ -134,9 +136,10 @@ def ov_run(model_dir, wav_path, chunk_size) :
 def main(args) :
     chunk_size = args.chunk_size
     if args.type.lower() == 'b' or args.type.lower() == 'o':
-        ov_run(args.ov_model_dir, args.audio)
+        ov_run(args.ov_model_dir, args.audio, args.chunk_size, True)
+        ov_run(args.ov_model_dir, args.audio, args.chunk_size, False)
     if args.type.lower() == 'b' or args.type.lower() == 'p':
-        pt_run(args.pt_model_dir, args.audio)
+        pt_run(args.pt_model_dir, args.audio, args.chunk_size)
 
 if __name__ == "__main__":
     _args = parse_args()

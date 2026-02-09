@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ov_model_dir", "-o",
         type=str,
-        default="../Fun-ASR-Nano-2512-OV",
+        default="../Fun-ASR-Nano-2512-ov",
         help="Path to the OpenVINO Fun-ASR-Nano model directory.",
     )
     parser.add_argument(
