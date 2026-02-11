@@ -2,7 +2,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import argparse
-
+import os
+import time
 from tools.utils import load_audio
 
 def parse_args() -> argparse.Namespace:
@@ -30,15 +31,19 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-def ov_run_short(ov_model, kwargs, wav_path):
+def run_short(ov_model, kwargs, wav_path):
+    st = time.perf_counter()
     res = ov_model.inference(data_in=[wav_path], **kwargs)
+    latency = time.perf_counter() - st
     text = res[0][0]['text']
-    print(f"Results: {text}")
+    print(f"{wav_path}: {text}")
+    return latency
 
-def ov_run_long(ov_model, kwargs, wav_path):
+def run_long(ov_model, kwargs, wav_path):
     chunk_size = kwargs.get('chunk_size', 0.72)
     tokenizer = kwargs.get("tokenizer", None)
     duration = sf.info(wav_path).duration
+    st = time.perf_counter()
     cum_durations = np.arange(chunk_size, duration + chunk_size, chunk_size)
     print(f"cum_durations={cum_durations}")
     prev_text = ""
@@ -47,9 +52,32 @@ def ov_run_long(ov_model, kwargs, wav_path):
         prev_text = ov_model.inference([torch.tensor(audio)], prev_text=prev_text, **kwargs)[0][0]["text"]
         if idx != len(cum_durations) - 1:
             prev_text = tokenizer.decode(tokenizer.encode(prev_text)[:-5]).replace("�", "")
-    # if prev_text:
-    #     print(prev_text)
-    print(f"Results: {prev_text}")
+    latency = time.perf_counter() - st
+    print(f"{wav_path}: {prev_text}")
+    return latency
+
+def run(mode, model, wav_path, kwargs) :
+    if os.path.isdir(wav_path):
+        audio_files = sorted([
+            (os.path.join(wav_path, file_name))
+            for file_name in os.listdir(wav_path)
+            if os.path.isfile(os.path.join(wav_path, file_name))
+        ])
+    else :
+        audio_files = [wav_path]
+    
+    total_duration = 0.0
+    total_latency = 0.0
+    for filepath in audio_files:
+        duration = sf.info(filepath).duration
+        total_duration += duration
+        if duration > 30:
+            latency = run_long(model, kwargs, filepath)
+        else :
+            latency = run_short(model, kwargs, filepath)
+        total_latency += latency
+    rtf = total_latency / total_duration if total_duration > 0 else float('inf')
+    print(f"{mode} inference rtf : {rtf:.3f}")
 
 def ov_run(model_dir, wav_path, chunk_size) :
     print(f"### RUN OpenVINO Inference ###")
@@ -57,22 +85,15 @@ def ov_run(model_dir, wav_path, chunk_size) :
     # model_dir = "../Fun-ASR-Nano-2512-ov"
     ov_model = FunAsrNanoEncDecModel(ov_core=None,
                                         model_path=model_dir,
-                                        enc_type="bf16",
+                                        enc_type="f16",
                                         dec_type="bf16",
                                         cache_size=1024,
+                                        for_dialect=True,
                                         disable_ctc=True)
     kwargs = {}
     kwargs['tokenizer']=ov_model.tokenizer
-    #kwargs['hotwords']=["开放时间"]
-    kwargs['language']="中文"
-    kwargs['itn']=True
     kwargs['chunk_size']=chunk_size
-
-    duration = sf.info(wav_path).duration
-    if duration > 30:
-        ov_run_long(ov_model, kwargs, wav_path)
-    else :
-        ov_run_short(ov_model, kwargs, wav_path)
+    return run("OpenVINO", ov_model, wav_path, kwargs)
 
 def main(args) :
     ov_run(args.ov_model_dir, args.audio, args.chunk_size)

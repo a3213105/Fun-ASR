@@ -558,7 +558,9 @@ class FunASRNano(nn.Module):
                     speech_idx += 1
         return inputs_embeds, contents, batch, source_ids, meta_data
 
-    def get_prompt(self, hotwords: list[str], language: str = None, itn: bool = True):
+    def get_prompt(self, hotwords: list[str], language: str = None, itn: bool = True, dialect: bool = False):
+        if dialect:
+            return f"语种方言识别："
         if len(hotwords) > 0:
             hotwords = ", ".join(hotwords)
             prompt = f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
@@ -601,7 +603,8 @@ class FunASRNano(nn.Module):
         **kwargs,
     ):
         prompt = self.get_prompt(
-            kwargs.get("hotwords", []), kwargs.get("language", None), kwargs.get("itn", True)
+            kwargs.get("hotwords", []), kwargs.get("language", None), kwargs.get("itn", True),
+            kwargs.get("dialect", False)
         )
         data_in = [self.generate_chatml(prompt, data) for data in data_in]
 

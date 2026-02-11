@@ -32,6 +32,75 @@ except ImportError:
     from openvino.runtime import opset13
 import nncf
 
+
+import torch
+from typing import Tuple
+
+def diff_mask_allclose(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+    equal_nan: bool = False,
+    max_print: int = 10,
+) -> Tuple[torch.Tensor, int, int, torch.Tensor]:
+    """
+    比较 a 与 b 的近似相等性（逐元素），并按“最后一维为列，其它维为行”的语义统计行相等情况。
+
+    返回：
+      - mask_neq: 与 a/b 同形的布尔张量，True 表示该元素“不近似相等”
+      - num_neq: 不近似相等的元素总数（int）
+      - num_equal_rows: 完全近似相等的“行”数（int），行的定义：除最后一维外的切片
+      - row_equal_mask: shape 为 (∏a.shape[:-1],)，每个元素对应一行是否完全近似相等（bool）
+
+    打印：
+      - 前 max_print 个不近似相等的元素位置与数值差异
+    """
+    # ---- 基本校验 ----
+    if a.shape != b.shape:
+        raise ValueError(f"shape 不一致：{a.shape} vs {b.shape}")
+    if a.device != b.device:
+        raise ValueError(f"device 不一致：{a.device} vs {b.device}")
+
+    # ---- 逐元素近似比较 ----
+    close_mask = torch.isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    mask_neq = ~close_mask
+    num_neq = int(mask_neq.sum().item())
+
+    # ---- 打印前 max_print 个不近似相等的元素 ----
+    if num_neq > 0 and max_print > 0:
+        idxs = torch.nonzero(mask_neq, as_tuple=False)  # 每行是一个坐标
+        k = min(num_neq, max_print)
+        print(f"[diff] 不近似相等元素个数 = {num_neq}（展示前 {k} 个）")
+
+        a_cpu = a.detach().cpu()
+        b_cpu = b.detach().cpu()
+        for i in range(k):
+            idx_tuple = tuple(int(x) for x in idxs[i].tolist())
+            va = a_cpu[idx_tuple].item()
+            vb = b_cpu[idx_tuple].item()
+            print(f"  #{i+1} 位置 {idx_tuple}: a={va}, b={vb}, |Δ|={abs(va - vb)}")
+
+    # ---- 行定义：最后一维是列，其它全部维度展平为行 ----
+    if a.ndim == 0:
+        # 标量：没有“行/列”的概念，按 1 行 1 列处理
+        row_equal_mask = close_mask.view(1)
+        num_equal_rows = int(row_equal_mask.sum().item())
+        print(f"[row] 标量视作 1 行：完全近似相等的行数={num_equal_rows}")
+        return mask_neq, num_neq, num_equal_rows, row_equal_mask
+
+    n_cols = a.shape[-1]
+    n_rows = a.numel() // n_cols
+
+    # 将前面所有维度展平成行，最后一维保留为列
+    close_2d = close_mask.reshape(n_rows, n_cols)
+    row_equal_mask = close_2d.all(dim=1)             # 每一行所有列都近似相等才算这一行相等
+    num_equal_rows = int(row_equal_mask.sum().item())
+
+    print(f"[row] 以最后一维为列：总行数={n_rows}，每行列数={n_cols}，完全近似相等的行数={num_equal_rows}")
+
+    return mask_neq, num_neq#, num_equal_rows, row_equal_mask
+
 def model_has_state(ov_model: ov.Model):
     return len(ov_model.get_sinks()) > 0
 
@@ -602,7 +671,7 @@ class GlmAsrForOVConvertWrapper(GenerationMixin):
 
         self.dec_wrapper = ModelDecoderWrapper(model)
         self.dec_wrapper.eval()
-        
+
         self.using_ov = False
         self.ov_core = None
         self.cache_size = 1000
@@ -1017,7 +1086,7 @@ class GlmAsrForOVConvertWrapper1(GenerationMixin):
 
         self.dec_wrapper = ModelDecoderWrapper(model)
         self.dec_wrapper.eval()
-        
+
         self.using_ov = False
         self.ov_core = None
         self.cache_size = 1000
@@ -1319,13 +1388,9 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
 
             def forward(self, speech, speech_lengths):
                 with torch.no_grad():
-                    # encoder_out, encoder_out_lens = self.model.encode(speech, speech_lengths)
                     encoder_out, encoder_out_lens = self.model.audio_encoder(speech, speech_lengths)
                     adaptor_out, adaptor_out_lens = self.model.audio_adaptor(encoder_out, encoder_out_lens)
                 return adaptor_out, adaptor_out_lens
-                    # inputs_embeds = self.model.llm.model.get_input_embeddings()(input_ids)
-                # return adaptor_out, adaptor_out_lens, inputs_embeds
-                # return encoder_out, encoder_out_lens, adaptor_out, adaptor_out_lens, inputs_embeds
 
         class ModelAudioEncoderWithCTCWrapper(torch.nn.Module):
             def __init__(self, model):
@@ -1428,64 +1493,10 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
         self.text_enc_wrapper.eval()
         self.dec_wrapper = ModelDecoderWrapper(model)
         self.dec_wrapper.eval()
-            
-    def get_prompt(self, hotwords: list[str], language: str = None, itn: bool = True):
-        if len(hotwords) > 0:
-            hotwords = ", ".join(hotwords)
-            prompt = f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
-            prompt += f"热词列表：[{hotwords}]\n"
-        else:
-            prompt = ""
-        if language is None:
-            prompt += "语音转写"
-        else:
-            prompt += f"语音转写成{language}"
-        if not itn:
-            prompt += "，不进行文本规整"
-        return prompt + "："
 
-    def generate_chatml(self, prompt: str, data: Union[str, torch.Tensor]):
-        if isinstance(data, str):
-            return [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"{prompt}<|startofspeech|>!{data}<|endofspeech|>"},
-                {"role": "assistant", "content": "null"},
-            ]
-        elif isinstance(data, torch.Tensor):
-            return [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {
-                    "role": "user",
-                    "content": f"{prompt}<|startofspeech|>!!<|endofspeech|>",
-                    "audio": data,
-                },
-                {"role": "assistant", "content": "null"},
-            ]
-
-    def data_template(self, data):
-        system, user, assistant = [], [], []
-        for i, item in enumerate(data):
-            role = item["role"]
-            content = item["content"]
-            if role == "system":
-                system.append(content)
-            elif role == "user":
-                if "audio" in item:
-                    audio = item["audio"]
-                    content = [content, audio]
-                user.append(content)
-            elif role == "assistant":
-                assistant.append(content)
-
-        system = system * len(user)
-
-        contents = {
-            "system": system,
-            "user": user,
-            "assistant": assistant,
-        }
-
-        return contents
+    def get_prompt_did(self):
+        prompt = f"语种方言识别："
+        return prompt
 
     def inference(
         self,
@@ -1496,11 +1507,8 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
         frontend=None,
         **kwargs,
     ):
-        meta_data = {}
-        prompt = self.get_prompt(
-            kwargs.get("hotwords", []), kwargs.get("language", None), kwargs.get("itn", True)
-        )
-        data_in = [self.generate_chatml(prompt, data) for data in data_in]
+        prompt = self.get_prompt_did()
+        data_in = [self.pt_model.generate_chatml(prompt, data) for data in data_in]
 
         if key is None:
             key = []
@@ -1508,7 +1516,8 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
                 chars = string.ascii_letters + string.digits
                 key.append("rand_key_" + "".join(random.choice(chars) for _ in range(13)))
 
-        contents = self.data_template(data_in[0])
+        meta_data = {}
+        contents = self.pt_model.data_template(data_in[0])
         output = self.pt_model.data_load_speech(contents, tokenizer, frontend, meta_data=meta_data, **kwargs)
         self.convert_ov_others(tokenizer, frontend, **kwargs)
 
@@ -1523,9 +1532,6 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
         fake_token_len[fake_token_len < 0] = 0
         fbank_beg[fbank_beg < 0] = 0
 
-            # speech_lengths = batch["speech_lengths"][:, 0]
-        # adaptor_out, adaptor_out_lens, inputs_embeds = self.enc_wrapper(speech, speech_lengths, input_ids)
-        # adaptor_out, adaptor_out_lens, inputs_embeds = self.convert_ov_encoder_model(speech, speech_lengths, input_ids)
         adaptor_out, adaptor_out_lens, inputs_embeds, ctc_logits, yseqs = self.convert_ov_encoder_model(speech, speech_lengths, input_ids)
 
         batch_size, token_num, dims = inputs_embeds.shape
@@ -1623,25 +1629,23 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
       
     def save_frontend_config(self, frontend, **kwargs):
         if not self.frontend_config_path.exists() :
+            print(f"### frontend={frontend.__class__.__name__}")
             frontend_config = {
                 # Frontend settings
                 "frontend_type": "WavFrontend",
+                "cmvn_file": frontend.cmvn_file,
                 "fs": frontend.fs,
-                "frame_shift": frontend.frame_shift,
+                "window": frontend.window,
+                "n_mels": frontend.n_mels,
                 "frame_length": frontend.frame_length,
+                "frame_shift": frontend.frame_shift,
+                "filter_length_min": frontend.filter_length_min,
+                "filter_length_max": frontend.filter_length_max,
                 "lfr_m": frontend.lfr_m,
                 "lfr_n": frontend.lfr_n,
-                "n_mels": frontend.n_mels,
-                "window": frontend.window,
-                "dither": 0.0,  # Set to 0 for deterministic inference (original uses dither=1.0 which adds random noise)
-                # Inference kwargs for data_load_speech
-                "dataset_conf": kwargs.get("dataset_conf", {}),
-                "multiturn_num_max": kwargs.get("multiturn_num_max", 5),
-                "max_token_length": kwargs.get("max_token_length", 1500),
-                "infer_with_assistant_input": kwargs.get("infer_with_assistant_input", False),
-                "data_type": kwargs.get("data_type", "sound"),
-                "max_length": kwargs.get("max_length", 512),
-                "batch_size": kwargs.get("batch_size", 1),
+                "dither": 0.0, # Set to 0 for deterministic inference (original uses dither=1.0 which adds random noise)
+                "snip_edges": frontend.snip_edges,
+                "upsacle_samples": frontend.upsacle_samples,
             }
             with open(self.frontend_config_path, "w") as f:
                 json.dump(frontend_config, f, indent=2)
@@ -1698,8 +1702,10 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
             del ov_model
             cleanup_torchscript_cache()
 
+        adaptor_out, adaptor_out_lens = self.audio_enc_wrapper(speech, speech_lengths)
+    
         adaptor_out, adaptor_out_lens, ctc_logits, yseqs = self.audio_enc_ctc_wrapper(speech, speech_lengths)
-        
+
         if not self.ov_text_path.exists() :
             example_inputs = {"input_ids":input_ids}
             ov_model = convert_model(self.text_enc_wrapper, example_input=example_inputs)
@@ -1723,8 +1729,8 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
                 inputs_embeds = self.text_enc_wrapper(input_ids)
                 self.convert_ov_decoder_model(inputs_embeds=inputs_embeds,
                                               attention_mask=attention_mask,
-                                              # position_ids=position_ids,
-                                              # cache_position=cache_position,
+                                            #   position_ids=position_ids,
+                                            #   cache_position=cache_position,
                                               past_key_values=past_key_values)
             logits, past_key_values = self.dec_wrapper(
                 inputs_embeds=inputs_embeds,
@@ -1743,7 +1749,7 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
                                  quantization_config=None):
         if not self.ov_decoder_path.exists() :
             caches = []
-            input_names = ["inputs_embeds", "attention_mask",]# "position_ids", "cache_position"]
+            input_names = ["inputs_embeds", "attention_mask"]#, "position_ids", "cache_position"]
             output_names = ["logits"]
 
             if isinstance(past_key_values, DynamicCache):
@@ -1774,4 +1780,3 @@ class FunAsrNanoConverterWrapper(GenerationMixin) :
             del ov_model
             cleanup_torchscript_cache()
             print(f"✅ ModelDecoder completed {self.ov_decoder_path}")
-
