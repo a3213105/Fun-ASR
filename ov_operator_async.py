@@ -971,10 +971,10 @@ def forced_align(log_probs: torch.Tensor, targets: torch.Tensor, blank: int = 0)
         print(f"### forced_align failed: {e}")
     return items
 
-
 class FunAsrNanoEncDecModel(BaseEncDecGenModel) :
     def __init__(self, ov_core, model_path, enc_type, dec_type, cache_size, for_dialect=True, disable_ctc=False):
         self.disable_ctc = disable_ctc
+        self.using_ctc = not disable_ctc
         self.load_ov_config_once = False
         self.for_dialect = for_dialect
         super().__init__(ov_core, model_path, enc_type, dec_type, cache_size)
